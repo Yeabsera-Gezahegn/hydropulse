@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#0f172a">
+  <meta name="description" content="HydroPulse - Hardware-Free Low-Bandwidth Early Flash-Flood & Landslide Warning System">
+  <title>HydroPulse | Early Warning System</title>
+  
+  <link rel="manifest" href="/static/manifest.json">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand">
+      <span class="brand-icon">⚡</span>
+      <h1 class="brand-title">HydroPulse</h1>
+      <span class="badge" id="network-badge">Online</span>
+    </div>
+    <button class="btn-refresh" id="refresh-btn" aria-label="Refresh Data">↻ Sync</button>
+  </header>
+
+  <main class="map-container">
+    <div id="map"></div>
+
+    <!-- Interactive Metrics Overlay Drawer -->
+    <aside class="detail-drawer" id="detail-drawer">
+      <div class="drawer-header">
+        <h2 class="drawer-title" id="cell-location">Cell Assessment</h2>
+        <span class="risk-badge badge-low" id="cell-risk-badge">LOW</span>
+      </div>
+
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <span class="metric-label">Rainfall Rate</span>
+          <span class="metric-value" id="val-rain">0.0 <small>mm/hr</small></span>
+        </div>
+        <div class="metric-card">
+          <span class="metric-label">Slope Gradient</span>
+          <span class="metric-value" id="val-slope">0.0 <small>°</small></span>
+        </div>
+        <div class="metric-card">
+          <span class="metric-label">Time to Peak Surge</span>
+          <span class="metric-value highlight" id="val-time-to-peak">-- <small>hrs</small></span>
+        </div>
+        <div class="metric-card">
+          <span class="metric-label">Last Evaluation</span>
+          <span class="metric-value" id="val-timestamp">--</span>
+        </div>
+      </div>
+      <p class="drawer-footer">Select any grid square on the map for coordinate-level risk details.</p>
+    </aside>
+  </main>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

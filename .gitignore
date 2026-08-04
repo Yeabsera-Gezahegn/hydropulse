@@ -1,0 +1,33 @@
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual Environments
+venv/
+.venv/
+env/
+
+# Environment variables & local configuration
+.env
+.env.local
+
+# Satellite data & temporary caches (keep directories, ignore large binaries)
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*.tmp
+
+# IDE / Editor metadata
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+.DS_Store
+Thumbs.db
