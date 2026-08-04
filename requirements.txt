@@ -5,3 +5,4 @@ h5netcdf>=1.1.0
 pytest>=8.0.0
 uvicorn
 fastapi
+gunicorn
