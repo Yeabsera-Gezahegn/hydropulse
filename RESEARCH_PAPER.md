@@ -176,7 +176,7 @@ Model predictions were thresholded at $R \ge 0.50$ and evaluated against ground-
 | :--- | :--- |
 | **True Positives (TP)** | 324 |
 | **False Positives (FP)** | 56 |
-| **True Negatives (TN) ** | 560 |
+| True Negatives (TN)  | 560 |
 | **False Negatives (FN)** | 60 |
 | **Overall Accuracy** | **88.40%** |
 | **Sensitivity (Recall)** | **84.38%** |
