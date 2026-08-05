@@ -6,6 +6,7 @@ import pycountry
 import geonamescache
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import requests
 
 st.set_page_config(
     page_title="HydroPulse | Hydrological Risk Analytics",
@@ -29,6 +30,82 @@ TIER_FACTORS = {
     "Critical": (1.05, 0.92),
 }
 
+# ---------------------------------------------------------------------------
+# LIVE WEATHER — Open-Meteo API
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=600)
+def fetch_live_weather(lat: float, lon: float) -> dict:
+    """
+    Fetch current conditions and 72-hour hourly precipitation forecast from
+    Open-Meteo.  Returns a dict with keys:
+        precipitation_mm_hr, temperature_c, humidity_pct, wind_speed_kmh,
+        hourly_precipitation (list[float], 72 values), live (bool)
+
+    Falls back gracefully to None-filled values when offline or rate-limited.
+    """
+    url = (
+        "https://api.open-meteo.com/v1/forecast"
+        f"?latitude={lat}&longitude={lon}"
+        "&current=precipitation,rain,showers,temperature_2m,"
+        "relative_humidity_2m,wind_speed_10m"
+        "&hourly=precipitation,rain"
+        "&forecast_days=3"
+        "&timezone=auto"
+    )
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        current = data.get("current", {})
+        hourly = data.get("hourly", {})
+
+        precip_current = current.get("precipitation", 0.0) or 0.0
+        rain_current = current.get("rain", 0.0) or 0.0
+        showers_current = current.get("showers", 0.0) or 0.0
+        # total precipitation rate = sum of rain + showers + any other precip
+        total_precip = precip_current + rain_current + showers_current
+
+        hourly_precip_raw = hourly.get("precipitation", [])
+        hourly_rain_raw = hourly.get("rain", [])
+        # combine rain + precipitation for a robust hourly signal
+        n = max(len(hourly_precip_raw), len(hourly_rain_raw))
+        hourly_combined = []
+        for i in range(n):
+            p = hourly_precip_raw[i] if i < len(hourly_precip_raw) else 0.0
+            r = hourly_rain_raw[i] if i < len(hourly_rain_raw) else 0.0
+            hourly_combined.append(float((p or 0.0) + (r or 0.0)))
+
+        # Ensure exactly 72 values — pad/truncate
+        if len(hourly_combined) >= 72:
+            hourly_combined = hourly_combined[:72]
+        else:
+            hourly_combined += [0.0] * (72 - len(hourly_combined))
+
+        return {
+            "precipitation_mm_hr": round(total_precip, 2),
+            "temperature_c": round(current.get("temperature_2m", 0.0) or 0.0, 1),
+            "humidity_pct": round(current.get("relative_humidity_2m", 0.0) or 0.0, 1),
+            "wind_speed_kmh": round(current.get("wind_speed_10m", 0.0) or 0.0, 1),
+            "hourly_precipitation": hourly_combined,
+            "live": True,
+        }
+
+    except Exception:
+        return {
+            "precipitation_mm_hr": None,
+            "temperature_c": None,
+            "humidity_pct": None,
+            "wind_speed_kmh": None,
+            "hourly_precipitation": [0.0] * 72,
+            "live": False,
+        }
+
+
+# ---------------------------------------------------------------------------
+# CACHED HELPERS
+# ---------------------------------------------------------------------------
 
 @st.cache_data
 def load_countries():
@@ -43,6 +120,10 @@ def load_cities():
     gc = geonamescache.GeonamesCache()
     return gc.get_cities()
 
+
+# ---------------------------------------------------------------------------
+# HYDROLOGY HELPERS
+# ---------------------------------------------------------------------------
 
 def location_seed(latitude: float, longitude: float) -> int:
     return int(abs(latitude * 1_000 + longitude * 1_000)) % (2**32)
@@ -143,22 +224,39 @@ def generate_forecast_data(
     center_lat: float,
     center_lon: float,
     forecast_hours: int,
-    rainfall_rate: float,
     slope_pct: float,
     seed: int,
+    live_hourly_precip: list,
 ) -> pd.DataFrame:
+    """
+    Build the hydrograph DataFrame.
+
+    When live_hourly_precip contains non-zero values (Open-Meteo feed is
+    active), those values are used directly as the rainfall signal.
+    Otherwise the function falls back to the location-seeded sine wave model.
+    """
     rng = np.random.default_rng(seed + 303)
     slope_deg = slope_pct_to_degrees(slope_pct)
-    periods = pd.date_range("2026-08-01", periods=forecast_hours, freq="h")
-    phase = abs(center_lat + center_lon) % (2 * np.pi)
+    periods = pd.date_range("now", periods=forecast_hours, freq="h", tz="UTC")
 
-    rainfall = rainfall_rate * (
-        0.55 + 0.45 * np.sin(np.linspace(0, 2 * np.pi, forecast_hours) + phase)
-    ) + rng.normal(0, rainfall_rate * 0.08, forecast_hours)
+    # ---- rainfall array ----
+    live_slice = live_hourly_precip[:forecast_hours]
+    if any(v > 0.0 for v in live_slice):
+        # Live feed: use directly, add tiny sensor noise
+        rainfall = np.array(live_slice, dtype=float) + rng.normal(0, 0.05, forecast_hours)
+    else:
+        # Fallback: location-seeded sinusoidal model
+        phase = abs(center_lat + center_lon) % (2 * np.pi)
+        base_rate = max(np.mean(live_hourly_precip) if live_hourly_precip else 5.0, 1.0)
+        rainfall = base_rate * (
+            0.55 + 0.45 * np.sin(np.linspace(0, 2 * np.pi, forecast_hours) + phase)
+        ) + rng.normal(0, base_rate * 0.08, forecast_hours)
+
+    # ---- discharge (unit hydrograph convolution proxy) ----
     discharge = (
         4.0
-        + (rainfall_rate * 0.9)
-        + 12.0 * np.maximum(0, np.sin(np.linspace(-0.4, 2.4 * np.pi, forecast_hours) + phase))
+        + (np.mean(np.clip(rainfall, 0, None)) * 0.9)
+        + 12.0 * np.maximum(0, np.sin(np.linspace(-0.4, 2.4 * np.pi, forecast_hours)))
         + rng.normal(0, 1.2, forecast_hours)
     )
 
@@ -171,7 +269,7 @@ def generate_forecast_data(
         rows.append({
             "timestamp": timestamp,
             "hour_offset": idx,
-            "label": timestamp.strftime("%H:%M"),
+            "label": f"T+{idx:02d}h",
             "rainfall_mm_hr": round(rain_val, 2),
             "runoff_m3_s": round(runoff_val, 2),
             "water_level_m": round(compute_water_level(rain_val, risk_score, center_lat, seed + idx), 2),
@@ -181,6 +279,10 @@ def generate_forecast_data(
 
     return pd.DataFrame(rows)
 
+
+# ---------------------------------------------------------------------------
+# PLOTLY CHARTS
+# ---------------------------------------------------------------------------
 
 def build_dual_axis_hydrograph(hydro_df: pd.DataFrame) -> go.Figure:
     fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -215,6 +317,10 @@ def build_dual_axis_hydrograph(hydro_df: pd.DataFrame) -> go.Figure:
     return fig
 
 
+# ---------------------------------------------------------------------------
+# EXPORT
+# ---------------------------------------------------------------------------
+
 def build_export_dataframe(
     country: str,
     city: str,
@@ -248,6 +354,10 @@ def build_export_dataframe(
     )
 
 
+# ---------------------------------------------------------------------------
+# ALERT SYSTEM
+# ---------------------------------------------------------------------------
+
 def render_alert_system(active_band: str, rainfall: float, slope_pct: float) -> None:
     st.subheader("Alert System")
     cols = st.columns(4)
@@ -270,7 +380,9 @@ def render_alert_system(active_band: str, rainfall: float, slope_pct: float) -> 
     )
 
 
-# --- SIDEBAR ---
+# ===========================================================================
+# SIDEBAR
+# ===========================================================================
 st.sidebar.header("Controls")
 
 countries = load_countries()
@@ -302,6 +414,9 @@ else:
     map_latitude = st.sidebar.number_input("Latitude", value=6.50, format="%.4f")
     map_longitude = st.sidebar.number_input("Longitude", value=38.00, format="%.4f")
 
+# ---- Live weather fetch ----
+weather = fetch_live_weather(map_latitude, map_longitude)
+
 location_rng_seed = location_seed(map_latitude, map_longitude)
 location_defaults = np.random.default_rng(location_rng_seed)
 location_id = f"{map_latitude:.4f}_{map_longitude:.4f}"
@@ -311,11 +426,19 @@ selected_risk = st.sidebar.multiselect(
     RISK_LEVELS,
     default=RISK_LEVELS,
 )
+
+# Rainfall slider: default from live feed when available, else location-seeded
+live_precip = weather["precipitation_mm_hr"]
+default_rainfall = (
+    float(round(live_precip, 1))
+    if live_precip is not None
+    else float(round(8.0 + location_defaults.uniform(0, 18), 1))
+)
 rainfall_rate = st.sidebar.slider(
     "Rainfall (mm/hr)",
     min_value=0.0,
     max_value=50.0,
-    value=float(round(8.0 + location_defaults.uniform(0, 18), 1)),
+    value=min(default_rainfall, 50.0),
     step=0.1,
     key=f"rainfall_{location_id}",
 )
@@ -335,7 +458,9 @@ forecast_horizon = st.sidebar.slider(
     step=6,
 )
 
-# --- LOCALIZED CALCULATIONS ---
+# ===========================================================================
+# CALCULATIONS
+# ===========================================================================
 slope_degrees = slope_pct_to_degrees(slope_gradient_pct)
 risk_index = compute_risk_score(rainfall_rate, slope_degrees)
 active_risk_band = classify_risk_level(risk_index)
@@ -350,31 +475,74 @@ spatial_full = generate_spatial_grid(
     location_rng_seed,
 )
 forecast_df = generate_forecast_data(
-    map_latitude,
-    map_longitude,
-    forecast_horizon,
-    rainfall_rate,
-    slope_gradient_pct,
-    location_rng_seed,
+    center_lat=map_latitude,
+    center_lon=map_longitude,
+    forecast_hours=forecast_horizon,
+    slope_pct=slope_gradient_pct,
+    seed=location_rng_seed,
+    live_hourly_precip=weather["hourly_precipitation"],
 )
 
 active_risk_filter = selected_risk if selected_risk else RISK_LEVELS
 spatial_filtered = spatial_full[spatial_full["risk_level"].isin(active_risk_filter)].copy()
 
-# --- MAIN UI ---
+# ===========================================================================
+# MAIN UI
+# ===========================================================================
 st.title("🌊 HydroPulse")
 st.subheader("Real-Time Flood & Risk Monitoring Dashboard")
-st.markdown(
-    f"Monitoring **{selected_city_name}, {selected_country}** "
-    f"({map_latitude:.4f}°, {map_longitude:.4f}°)"
+
+# Live feed status indicator
+if weather["live"]:
+    st.markdown(
+        "🟢 **Live Weather Feed (Open-Meteo API)** &nbsp;|&nbsp; "
+        f"Monitoring **{selected_city_name}, {selected_country}** "
+        f"({map_latitude:.4f}°, {map_longitude:.4f}°)",
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown(
+        "🔴 **Offline / Fallback Mode** &nbsp;|&nbsp; "
+        f"Monitoring **{selected_city_name}, {selected_country}** "
+        f"({map_latitude:.4f}°, {map_longitude:.4f}°) — using location-seeded estimates",
+        unsafe_allow_html=True,
+    )
+
+# ---- Top metric cards ----
+metric_cols = st.columns(7)
+
+# Precipitation (live)
+metric_cols[0].metric(
+    "☔ Precipitation",
+    f"{weather['precipitation_mm_hr']:.2f} mm/hr" if weather["precipitation_mm_hr"] is not None else "N/A",
+    "Live observed" if weather["live"] else "Offline",
 )
 
-metric_cols = st.columns(5)
-metric_cols[0].metric("Rainfall Rate", f"{rainfall_rate:.2f} mm/hr", selected_city_name)
-metric_cols[1].metric("Slope Gradient", f"{slope_gradient_pct:.1f}%", "Topography")
-metric_cols[2].metric("Water Level", f"{water_level:.2f} m", "Localized estimate")
-metric_cols[3].metric("Risk Index", f"{risk_index:.0%}", active_risk_band)
-metric_cols[4].metric("Time to Peak Surge", f"{time_to_peak:.1f} hrs", f"{forecast_horizon}h forecast")
+# Temperature (live)
+metric_cols[1].metric(
+    "🌡️ Temperature",
+    f"{weather['temperature_c']:.1f} °C" if weather["temperature_c"] is not None else "N/A",
+    "Live observed" if weather["live"] else "Offline",
+)
+
+# Humidity (live)
+metric_cols[2].metric(
+    "💧 Humidity",
+    f"{weather['humidity_pct']:.1f}%" if weather["humidity_pct"] is not None else "N/A",
+    "Live observed" if weather["live"] else "Offline",
+)
+
+# Wind speed (live)
+metric_cols[3].metric(
+    "🌬️ Wind Speed",
+    f"{weather['wind_speed_kmh']:.1f} km/h" if weather["wind_speed_kmh"] is not None else "N/A",
+    "Live observed" if weather["live"] else "Offline",
+)
+
+# Derived hydrological metrics
+metric_cols[4].metric("Water Level", f"{water_level:.2f} m", "Localized estimate")
+metric_cols[5].metric("Risk Index", f"{risk_index:.0%}", active_risk_band)
+metric_cols[6].metric("Time to Peak Surge", f"{time_to_peak:.1f} hrs", f"{forecast_horizon}h forecast")
 
 st.divider()
 render_alert_system(active_risk_band, rainfall_rate, slope_gradient_pct)
@@ -441,7 +609,8 @@ with col_map:
 
 with col_charts:
     st.subheader("Hydrograph & Risk Analytics")
-    st.markdown("**Water Discharge vs. Rainfall Forecast**")
+    source_label = "72-hr Open-Meteo forecast" if weather["live"] else "Location-seeded model"
+    st.markdown(f"**Water Discharge vs. Rainfall Forecast** — *{source_label}*")
     st.plotly_chart(build_dual_axis_hydrograph(forecast_df), use_container_width=True)
 
     st.markdown("**Regional Vulnerability Breakdown (%)**")
